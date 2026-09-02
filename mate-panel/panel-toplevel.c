@@ -124,6 +124,9 @@ struct _PanelToplevelPrivate {
 
 	guint                   hide_timeout;
 	guint                   unhide_timeout;
+#ifdef HAVE_WAYLAND
+	guint                   autohide_poll_timeout;
+#endif /* HAVE_WAYLAND */
 
 	GdkRectangle            geometry;
 	PanelFrameEdge          edges;
@@ -1568,9 +1571,18 @@ static gboolean panel_toplevel_update_struts(PanelToplevel* toplevel, gboolean e
 
 #ifdef HAVE_WAYLAND
 	if (GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel)))) {
+		int wl_thickness;
+
 		wayland_panel_toplevel_update_placement (toplevel);
+
+		if (orientation & PANEL_HORIZONTAL_MASK)
+			wl_thickness = toplevel->priv->geometry.height;
+		else
+			wl_thickness = toplevel->priv->geometry.width;
+
 		wayland_panel_toplevel_set_autohide (toplevel,
-			toplevel->priv->state == PANEL_STATE_AUTO_HIDDEN);
+			toplevel->priv->state == PANEL_STATE_AUTO_HIDDEN,
+			wl_thickness);
 	}
 #endif /* HAVE_WAYLAND */
 	return geometry_changed;
@@ -3130,6 +3142,12 @@ panel_toplevel_disconnect_timeouts (PanelToplevel *toplevel)
 	if (toplevel->priv->animation_timeout)
 		g_source_remove (toplevel->priv->animation_timeout);
 	toplevel->priv->animation_timeout = 0;
+
+#ifdef HAVE_WAYLAND
+	if (toplevel->priv->autohide_poll_timeout)
+		g_source_remove (toplevel->priv->autohide_poll_timeout);
+	toplevel->priv->autohide_poll_timeout = 0;
+#endif /* HAVE_WAYLAND */
 }
 
 static void
@@ -3774,6 +3792,46 @@ panel_toplevel_start_animation (PanelToplevel *toplevel)
 			g_timeout_add (20, (GSourceFunc) panel_toplevel_animation_timeout, toplevel);
 }
 
+#ifdef HAVE_WAYLAND
+/* On Wayland the hidden panel collapses to a thin sliver anchored to the
+ * screen edge, which is a very small target for enter events. So while the
+ * panel is auto-hidden we poll the pointer position and unhide as soon as it
+ * reaches the sliver, mirroring the X11 behaviour where hovering the visible
+ * part of a hidden panel brings it back. */
+#define AUTOHIDE_POLL_TIMEOUT_MS 50
+
+static gboolean
+panel_toplevel_autohide_poll_timeout (PanelToplevel *toplevel)
+{
+	g_return_val_if_fail (PANEL_IS_TOPLEVEL (toplevel), FALSE);
+
+	if (toplevel->priv->state != PANEL_STATE_AUTO_HIDDEN) {
+		toplevel->priv->autohide_poll_timeout = 0;
+		return FALSE;
+	}
+
+	if (panel_toplevel_contains_pointer (toplevel)) {
+		toplevel->priv->autohide_poll_timeout = 0;
+		panel_toplevel_queue_auto_unhide (toplevel);
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+static void
+panel_toplevel_start_autohide_poll (PanelToplevel *toplevel)
+{
+	if (toplevel->priv->autohide_poll_timeout)
+		return;
+
+	toplevel->priv->autohide_poll_timeout =
+		g_timeout_add (AUTOHIDE_POLL_TIMEOUT_MS,
+			(GSourceFunc) panel_toplevel_autohide_poll_timeout,
+			toplevel);
+}
+#endif /* HAVE_WAYLAND */
+
 void
 panel_toplevel_hide (PanelToplevel    *toplevel,
 		     gboolean          auto_hide,
@@ -3841,6 +3899,12 @@ panel_toplevel_hide (PanelToplevel    *toplevel,
         }
 
 	gtk_widget_queue_resize (GTK_WIDGET (toplevel));
+
+#ifdef HAVE_WAYLAND
+	if (auto_hide &&
+	    GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel))))
+		panel_toplevel_start_autohide_poll (toplevel);
+#endif /* HAVE_WAYLAND */
 }
 
 static gboolean
@@ -3879,6 +3943,13 @@ panel_toplevel_unhide (PanelToplevel *toplevel)
 	toplevel->priv->state = PANEL_STATE_NORMAL;
 
 	panel_toplevel_update_hide_buttons (toplevel);
+
+#ifdef HAVE_WAYLAND
+	if (toplevel->priv->autohide_poll_timeout) {
+		g_source_remove (toplevel->priv->autohide_poll_timeout);
+		toplevel->priv->autohide_poll_timeout = 0;
+	}
+#endif /* HAVE_WAYLAND */
 
 	if (toplevel->priv->attach_toplevel)
 		panel_toplevel_push_autohide_disabler (toplevel->priv->attach_toplevel);

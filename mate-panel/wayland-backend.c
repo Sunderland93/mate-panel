@@ -83,7 +83,8 @@ wayland_panel_toplevel_update_placement (PanelToplevel* toplevel)
 
 void
 wayland_panel_toplevel_set_autohide (PanelToplevel *toplevel,
-				     gboolean       autohide)
+				     gboolean       autohide,
+				     int            thickness)
 {
 	GtkWindow *window;
 
@@ -93,5 +94,5 @@ wayland_panel_toplevel_set_autohide (PanelToplevel *toplevel,
 		gtk_layer_set_exclusive_zone (window,
 			panel_toplevel_get_effective_auto_hide_size (toplevel));
 	else
-		gtk_layer_auto_exclusive_zone_enable (window);
+		gtk_layer_set_exclusive_zone (window, thickness);
 }
