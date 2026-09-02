@@ -91,7 +91,7 @@ wayland_panel_toplevel_set_autohide (PanelToplevel *toplevel,
 
 	if (autohide)
 		gtk_layer_set_exclusive_zone (window,
-			panel_toplevel_get_auto_hide_size (toplevel));
+			panel_toplevel_get_effective_auto_hide_size (toplevel));
 	else
-		gtk_layer_set_exclusive_zone (window, -1);
+		gtk_layer_auto_exclusive_zone_enable (window);
 }

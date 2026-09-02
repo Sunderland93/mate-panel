@@ -104,6 +104,7 @@ int                  panel_toplevel_get_monitor            (PanelToplevel       
 void                 panel_toplevel_set_auto_hide_size     (PanelToplevel       *toplevel,
                                                             int                  autohide_size);
 int                  panel_toplevel_get_auto_hide_size     (PanelToplevel       *toplevel);
+int                  panel_toplevel_get_effective_auto_hide_size (PanelToplevel *toplevel);
 void                 panel_toplevel_set_x                  (PanelToplevel       *toplevel,
                                                             int                  x,
                                                             int                  x_right,

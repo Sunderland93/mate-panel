@@ -1429,7 +1429,8 @@ static gboolean panel_toplevel_contains_pointer(PanelToplevel* toplevel)
 	return TRUE;
 }
 
-static inline int panel_toplevel_get_effective_auto_hide_size(PanelToplevel* toplevel)
+int
+panel_toplevel_get_effective_auto_hide_size (PanelToplevel *toplevel)
 {
 	int size;
 
@@ -1846,6 +1847,35 @@ panel_toplevel_update_auto_hide_position (PanelToplevel *toplevel,
 	}
 
 	panel_toplevel_get_monitor_geometry (toplevel, &monitor_geom);
+
+#ifdef HAVE_WAYLAND
+	/* On Wayland the panel is anchored to the screen edge by gtk-layer-shell,
+	 * so there is no need to slide it off-screen; the collapse to the
+	 * auto-hide sliver is handled in panel_toplevel_update_size(). Keep the
+	 * position flush against the anchored edge instead. */
+	if (GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel)))) {
+		auto_hide_size = panel_toplevel_get_effective_auto_hide_size (toplevel);
+
+		switch (toplevel->priv->orientation) {
+		case PANEL_ORIENTATION_TOP:
+			*y = 0;
+			break;
+		case PANEL_ORIENTATION_BOTTOM:
+			*y = monitor_geom.height - auto_hide_size;
+			break;
+		case PANEL_ORIENTATION_LEFT:
+			*x = 0;
+			break;
+		case PANEL_ORIENTATION_RIGHT:
+			*x = monitor_geom.width - auto_hide_size;
+			break;
+		default:
+			g_assert_not_reached ();
+			break;
+		}
+		return;
+	}
+#endif /* HAVE_WAYLAND */
 
 	width  = toplevel->priv->original_width;
 	height = toplevel->priv->original_height;
@@ -2426,6 +2456,38 @@ panel_toplevel_update_size (PanelToplevel  *toplevel,
 
 	width  = requisition->width;
 	height = requisition->height;
+
+#ifdef HAVE_WAYLAND
+	/* On Wayland the panel is anchored to the screen edge by gtk-layer-shell,
+	 * so auto-hide cannot slide the window off-screen as it does on X11.
+	 * Instead we collapse the panel thickness down to the auto-hide sliver
+	 * size; the exclusive zone is updated to match in
+	 * wayland_panel_toplevel_set_autohide(), so the rest of the work area
+	 * is reclaimed by other windows. */
+	if (GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (widget)) &&
+	    toplevel->priv->state == PANEL_STATE_AUTO_HIDDEN) {
+		int auto_hide_size;
+
+		auto_hide_size = panel_toplevel_get_effective_auto_hide_size (toplevel);
+
+		if (toplevel->priv->orientation & PANEL_HORIZONTAL_MASK) {
+			height = auto_hide_size;
+			if (toplevel->priv->expand)
+				width = monitor_geom.width;
+		} else {
+			width = auto_hide_size;
+			if (toplevel->priv->expand)
+				height = monitor_geom.height;
+		}
+
+		width  = MAX (1, width);
+		height = MAX (1, height);
+
+		toplevel->priv->geometry.width  = CLAMP (width,  0, monitor_geom.width);
+		toplevel->priv->geometry.height = CLAMP (height, 0, monitor_geom.height);
+		return;
+	}
+#endif /* HAVE_WAYLAND */
 
 	if (!toplevel->priv->expand &&
 	    !toplevel->priv->buttons_enabled && !toplevel->priv->attached)
@@ -3766,7 +3828,9 @@ panel_toplevel_hide (PanelToplevel    *toplevel,
 		panel_toplevel_update_hide_buttons (toplevel);
 	}
 
-	if (toplevel->priv->animate && gtk_widget_get_realized (GTK_WIDGET (toplevel))) {
+	if (toplevel->priv->animate &&
+	    !GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel))) &&
+	    gtk_widget_get_realized (GTK_WIDGET (toplevel))) {
 		panel_toplevel_start_animation (toplevel);
 	}
 
@@ -3819,7 +3883,9 @@ panel_toplevel_unhide (PanelToplevel *toplevel)
 	if (toplevel->priv->attach_toplevel)
 		panel_toplevel_push_autohide_disabler (toplevel->priv->attach_toplevel);
 
-	if (toplevel->priv->animate && gtk_widget_get_realized (GTK_WIDGET (toplevel))) {
+	if (toplevel->priv->animate &&
+	    !GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel))) &&
+	    gtk_widget_get_realized (GTK_WIDGET (toplevel))) {
 		panel_toplevel_start_animation (toplevel);
 	}
 
@@ -3831,7 +3897,8 @@ panel_toplevel_unhide (PanelToplevel *toplevel)
 
 	gtk_widget_queue_resize (GTK_WIDGET (toplevel));
 
-	if (!toplevel->priv->animate)
+	if (!toplevel->priv->animate ||
+	    GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel))))
 		g_signal_emit (toplevel, toplevel_signals [UNHIDE_SIGNAL], 0);
 }
 
@@ -3848,7 +3915,8 @@ panel_toplevel_auto_unhide_timeout_handler (PanelToplevel *toplevel)
 	if (toplevel->priv->animating)
 		return TRUE;
 
-	if (!toplevel->priv->animate)
+	if (!toplevel->priv->animate ||
+	    GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel))))
 		toplevel->priv->initial_animation_done = TRUE;
 
 	/* initial animation for auto-hidden panels: we need to unhide and hide
