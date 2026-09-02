@@ -20,7 +20,18 @@ DISTCHECK_CONFIGURE_FLAGS = \
 EXTRA_DIST = \
 	autogen.sh		\
 	COPYING-DOCS		\
-	HACKING
+	HACKING \
+	meson.build \
+	meson_options.txt \
+	applets/meson.build \
+	data/meson.build \
+	doc/meson.build \
+	help/meson.build \
+	icons/meson.build \
+	libmate-panel-applet/meson.build \
+	man/meson.build \
+	mate-panel/meson.build \
+	po/meson.build
 
 CLEANFILES = \
 	config.h
