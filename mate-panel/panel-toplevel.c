@@ -2486,11 +2486,18 @@ panel_toplevel_update_size (PanelToplevel  *toplevel,
 			height = auto_hide_size;
 			if (toplevel->priv->expand)
 				width = monitor_geom.width;
+			gtk_widget_set_size_request (widget, -1, auto_hide_size);
 		} else {
 			width = auto_hide_size;
 			if (toplevel->priv->expand)
 				height = monitor_geom.height;
+			gtk_widget_set_size_request (widget, auto_hide_size, -1);
 		}
+
+		/* force the layer-shell surface down to the sliver size; the
+		 * window would otherwise stay at the panel's taller natural
+		 * height and render a black block */
+		gtk_window_resize (GTK_WINDOW (widget), 1, 1);
 
 		width  = MAX (1, width);
 		height = MAX (1, height);
@@ -2584,6 +2591,13 @@ panel_toplevel_update_size (PanelToplevel  *toplevel,
 	toplevel->priv->geometry.height = CLAMP (height, 0, monitor_geom.height);
 	toplevel->priv->original_width  = toplevel->priv->geometry.width;
 	toplevel->priv->original_height = toplevel->priv->geometry.height;
+
+#ifdef HAVE_WAYLAND
+	/* undo the sliver size request forced on the auto-hide path so the
+	 * panel grows back to its natural size when it is unhidden */
+	if (GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel))))
+		gtk_widget_set_size_request (GTK_WIDGET (toplevel), -1, -1);
+#endif /* HAVE_WAYLAND */
 }
 
 static void
@@ -3793,11 +3807,13 @@ panel_toplevel_start_animation (PanelToplevel *toplevel)
 }
 
 #ifdef HAVE_WAYLAND
-/* On Wayland the hidden panel collapses to a thin sliver anchored to the
- * screen edge, which is a very small target for enter events. So while the
- * panel is auto-hidden we poll the pointer position and unhide as soon as it
- * reaches the sliver, mirroring the X11 behaviour where hovering the visible
- * part of a hidden panel brings it back. */
+/* On Wayland a layer-shell surface the hidden panel collapses to a thin sliver
+ * anchored to the screen edge, which is a very small target for enter events
+ * and crossing events in general are unreliable. So while autohide is enabled
+ * we poll the pointer position and drive both directions of the hide/unhide
+ * state machine from it, mirroring the X11 behaviour where moving the pointer
+ * over the visible part of a hidden panel brings it back and moving it away
+ * hides it again. */
 #define AUTOHIDE_POLL_TIMEOUT_MS 50
 
 static gboolean
@@ -3805,15 +3821,18 @@ panel_toplevel_autohide_poll_timeout (PanelToplevel *toplevel)
 {
 	g_return_val_if_fail (PANEL_IS_TOPLEVEL (toplevel), FALSE);
 
-	if (toplevel->priv->state != PANEL_STATE_AUTO_HIDDEN) {
+	if (!GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel))) ||
+	    !toplevel->priv->auto_hide) {
 		toplevel->priv->autohide_poll_timeout = 0;
 		return FALSE;
 	}
 
-	if (panel_toplevel_contains_pointer (toplevel)) {
-		toplevel->priv->autohide_poll_timeout = 0;
-		panel_toplevel_queue_auto_unhide (toplevel);
-		return FALSE;
+	if (toplevel->priv->state == PANEL_STATE_AUTO_HIDDEN) {
+		if (panel_toplevel_contains_pointer (toplevel))
+			panel_toplevel_queue_auto_unhide (toplevel);
+	} else if (toplevel->priv->state == PANEL_STATE_NORMAL) {
+		if (!panel_toplevel_contains_pointer (toplevel))
+			panel_toplevel_queue_auto_hide (toplevel);
 	}
 
 	return TRUE;
@@ -3943,13 +3962,6 @@ panel_toplevel_unhide (PanelToplevel *toplevel)
 	toplevel->priv->state = PANEL_STATE_NORMAL;
 
 	panel_toplevel_update_hide_buttons (toplevel);
-
-#ifdef HAVE_WAYLAND
-	if (toplevel->priv->autohide_poll_timeout) {
-		g_source_remove (toplevel->priv->autohide_poll_timeout);
-		toplevel->priv->autohide_poll_timeout = 0;
-	}
-#endif /* HAVE_WAYLAND */
 
 	if (toplevel->priv->attach_toplevel)
 		panel_toplevel_push_autohide_disabler (toplevel->priv->attach_toplevel);
