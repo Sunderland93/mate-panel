@@ -80,3 +80,18 @@ wayland_panel_toplevel_update_placement (PanelToplevel* toplevel)
 	for (int i = 0; i < GTK_LAYER_SHELL_EDGE_ENTRY_NUMBER; i++)
 		gtk_layer_set_anchor (window, i, anchor[i]);
 }
+
+void
+wayland_panel_toplevel_set_autohide (PanelToplevel *toplevel,
+				     gboolean       autohide)
+{
+	GtkWindow *window;
+
+	window = GTK_WINDOW (toplevel);
+
+	if (autohide)
+		gtk_layer_set_exclusive_zone (window,
+			panel_toplevel_get_auto_hide_size (toplevel));
+	else
+		gtk_layer_set_exclusive_zone (window, -1);
+}

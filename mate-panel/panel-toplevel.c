@@ -1568,6 +1568,8 @@ static gboolean panel_toplevel_update_struts(PanelToplevel* toplevel, gboolean e
 #ifdef HAVE_WAYLAND
 	if (GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel)))) {
 		wayland_panel_toplevel_update_placement (toplevel);
+		wayland_panel_toplevel_set_autohide (toplevel,
+			toplevel->priv->state == PANEL_STATE_AUTO_HIDDEN);
 	}
 #endif /* HAVE_WAYLAND */
 	return geometry_changed;
