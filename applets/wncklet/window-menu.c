@@ -43,6 +43,7 @@
 
 #ifdef HAVE_WAYLAND
 #include <gdk/gdkwayland.h>
+#include "wayland-window-menu.h"
 #endif /* HAVE_WAYLAND */
 
 #ifndef HAVE_X11
@@ -271,7 +272,7 @@ gboolean window_menu_applet_fill(MatePanelApplet* applet)
 #ifdef HAVE_WAYLAND
 	if (GDK_IS_WAYLAND_DISPLAY (gdk_display_get_default ()))
 	{
-		window_menu->selector = gtk_label_new ("[Window menu not supported on Wayland]");
+		window_menu->selector = wayland_window_menu_new ();
 	}
 	else
 #endif /* HAVE_WAYLAND */
