@@ -87,7 +87,11 @@ static void window_menu_about(GtkAction* action, WindowMenu* window_menu)
 		NULL
 	};
 
-	gtk_show_about_dialog(GTK_WINDOW(window_menu->applet),
+	GtkWidget* toplevel = gtk_widget_get_toplevel (window_menu->applet);
+	if (!GTK_IS_WINDOW (toplevel))
+		toplevel = NULL;
+
+	gtk_show_about_dialog(toplevel ? GTK_WINDOW(toplevel) : NULL,
 		"program-name", _("Window Selector"),
 		"title", _("About Window Selector"),
 		"authors", authors,
