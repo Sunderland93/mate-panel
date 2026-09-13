@@ -1776,6 +1776,26 @@ tasklist_rebuild (TasklistManager *tasklist)
 
 	tasklist->rebuilding = FALSE;
 
+	if (gtk_orientable_get_orientation (GTK_ORIENTABLE (tasklist->outer_box)) != GTK_ORIENTATION_VERTICAL)
+	{
+		GList *children = gtk_container_get_children (GTK_CONTAINER (tasklist->list));
+		guint visible = g_list_length (children);
+		g_list_free (children);
+
+		if (visible > 0)
+		{
+			GtkWidget *parent_box;
+			int button_space;
+
+			parent_box = gtk_widget_get_ancestor (tasklist->outer_box, GTK_TYPE_BOX);
+			tasklist_width = MAX (gtk_widget_get_allocated_width (parent_box),
+					      tasklist_width);
+			button_space = (tasklist_width / visible) * 0.75;
+			button_space = MIN (button_space, full_button_width);
+			adjust_buttons (GTK_CONTAINER (tasklist->list), button_space, visible, NULL);
+		}
+	}
+
 	gtk_widget_queue_resize (tasklist->list);
 }
 
