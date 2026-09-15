@@ -39,5 +39,10 @@
 
 void wayland_panel_toplevel_init (PanelToplevel* toplevel);
 void wayland_panel_toplevel_update_placement (PanelToplevel* toplevel);
+void wayland_panel_toplevel_move_resize (PanelToplevel*           toplevel,
+                                         const GdkRectangle      *geometry,
+                                         const GdkRectangle      *monitor_geom);
+void wayland_panel_toplevel_update_exclusive_zone (PanelToplevel* toplevel,
+                                                   gint           exclusive_zone);
 
 #endif /* __WAYLAND_BACKEND_H__ */

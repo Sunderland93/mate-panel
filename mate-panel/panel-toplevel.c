@@ -210,6 +210,14 @@ struct _PanelToplevelPrivate {
 	guint                   updated_geometry_initial : 1;
 	/* flag to see if we have done the initial animation */
 	guint                   initial_animation_done : 1;
+	/* whether the pointer is currently over this toplevel, as
+	   reported by enter/leave notifications (authoritative on
+	   Wayland where the window frame may not match the surface) */
+	guint                   pointer_inside : 1;
+	/* reserved work area (wlroots: exclusive_zone + margin) last
+	   committed while settled; kept constant while the panel slides
+	   so maximized windows don't move during the animation */
+	int                     wl_reserved;
 };
 
 enum {
@@ -1422,6 +1430,12 @@ static gboolean panel_toplevel_contains_pointer(PanelToplevel* toplevel)
 	if (x == -1 || y == -1)
 		return FALSE;
 
+#ifdef HAVE_WAYLAND
+	if (GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (widget))) {
+		return toplevel->priv->pointer_inside;
+	}
+#endif /* HAVE_WAYLAND */
+
 	if (x < toplevel->priv->geometry.x || x >= (toplevel->priv->geometry.x + toplevel->priv->geometry.width) ||
 	    y < toplevel->priv->geometry.y || y >= (toplevel->priv->geometry.y + toplevel->priv->geometry.height))
 		return FALSE;
@@ -1567,7 +1581,42 @@ static gboolean panel_toplevel_update_struts(PanelToplevel* toplevel, gboolean e
 
 #ifdef HAVE_WAYLAND
 	if (GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel)))) {
+		int  exclusive;
+		int  margin = 0;
+
 		wayland_panel_toplevel_update_placement (toplevel);
+
+		if (toplevel->priv->auto_hide) {
+			exclusive = 0;
+		} else {
+			switch (orientation) {
+			case PANEL_ORIENTATION_TOP:
+				margin = y - monitor_geom.y;
+				break;
+			case PANEL_ORIENTATION_BOTTOM:
+				margin = monitor_geom.y + monitor_geom.height - (y + height);
+				break;
+			case PANEL_ORIENTATION_LEFT:
+				margin = x - monitor_geom.x;
+				break;
+			case PANEL_ORIENTATION_RIGHT:
+				margin = monitor_geom.x + monitor_geom.width - (x + width);
+				break;
+			default:
+				break;
+			}
+
+			if (strut == 0) {
+				exclusive = 0;
+			} else if (toplevel->priv->animating) {
+				exclusive = MAX (0, toplevel->priv->wl_reserved - margin);
+			} else {
+				exclusive = (orientation & PANEL_HORIZONTAL_MASK) ? height : width;
+				toplevel->priv->wl_reserved = exclusive + margin;
+			}
+		}
+
+		wayland_panel_toplevel_update_exclusive_zone (toplevel, exclusive);
 	}
 #endif /* HAVE_WAYLAND */
 	return geometry_changed;
@@ -2919,20 +2968,36 @@ panel_toplevel_move_resize_window (PanelToplevel *toplevel,
 
 	g_assert (gtk_widget_get_realized (widget));
 
-	if (move && resize)
-		gdk_window_move_resize (gtk_widget_get_window (widget),
-					toplevel->priv->geometry.x,
-					toplevel->priv->geometry.y,
-					toplevel->priv->geometry.width,
-					toplevel->priv->geometry.height);
-	else if (move)
-		gdk_window_move (gtk_widget_get_window (widget),
-				 toplevel->priv->geometry.x,
-				 toplevel->priv->geometry.y);
-	else if (resize)
-		gdk_window_resize (gtk_widget_get_window (widget),
-				   toplevel->priv->geometry.width,
-				   toplevel->priv->geometry.height);
+#ifdef HAVE_WAYLAND
+	if (GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (widget))) {
+		/* Layer-shell windows are positioned by the compositor using
+		 * anchors and margins, so we translate the geometry to margins
+		 * relative to the monitor the panel is attached to. */
+		if (toplevel->priv->updated_geometry_initial) {
+			GdkRectangle monitor_geom;
+			panel_toplevel_get_monitor_geometry (toplevel, &monitor_geom);
+			wayland_panel_toplevel_move_resize (toplevel,
+							    &toplevel->priv->geometry,
+							    &monitor_geom);
+		}
+	} else
+#endif /* HAVE_WAYLAND */
+	{
+		if (move && resize)
+			gdk_window_move_resize (gtk_widget_get_window (widget),
+						toplevel->priv->geometry.x,
+						toplevel->priv->geometry.y,
+						toplevel->priv->geometry.width,
+						toplevel->priv->geometry.height);
+		else if (move)
+			gdk_window_move (gtk_widget_get_window (widget),
+					 toplevel->priv->geometry.x,
+					 toplevel->priv->geometry.y);
+		else if (resize)
+			gdk_window_resize (gtk_widget_get_window (widget),
+					   toplevel->priv->geometry.width,
+					   toplevel->priv->geometry.height);
+	}
 
 	if (resize || move) {
 		for (list = toplevel->priv->panel_widget->applet_list; list != NULL; list = g_list_next (list)) {
@@ -2963,6 +3028,17 @@ static void
 panel_toplevel_initially_hide (PanelToplevel *toplevel)
 {
 	if (!toplevel->priv->attached) {
+#ifdef HAVE_WAYLAND
+		if (GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel)))) {
+			toplevel->priv->initial_animation_done = TRUE;
+			if (!toplevel->priv->auto_hide)
+				toplevel->priv->state = PANEL_STATE_NORMAL;
+			else
+				toplevel->priv->state = PANEL_STATE_AUTO_HIDDEN;
+			gtk_widget_queue_resize (GTK_WIDGET (toplevel));
+			return;
+		}
+#endif /* HAVE_WAYLAND */
 		toplevel->priv->initial_animation_done = FALSE;
 
 		/* We start the panel off hidden until all the applets are
@@ -3546,7 +3622,18 @@ panel_toplevel_motion_notify_event (GtkWidget      *widget,
 static gboolean
 panel_toplevel_animation_timeout (PanelToplevel *toplevel)
 {
-	gtk_widget_queue_resize (GTK_WIDGET (toplevel));
+#ifdef HAVE_WAYLAND
+	if (GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel)))) {
+		if (toplevel->priv->animating) {
+			panel_toplevel_update_position (toplevel);
+			panel_toplevel_update_struts (toplevel, FALSE);
+			panel_toplevel_move_resize_window (toplevel, TRUE, TRUE);
+		}
+	} else
+#endif /* HAVE_WAYLAND */
+	{
+		gtk_widget_queue_resize (GTK_WIDGET (toplevel));
+	}
 
 	if (!toplevel->priv->animating) {
 		toplevel->priv->animation_end_x              = 0xdead;
@@ -3666,7 +3753,19 @@ panel_toplevel_start_animation (PanelToplevel *toplevel)
 #endif /* HAVE_X11 */
 	panel_toplevel_update_struts (toplevel, FALSE);
 
-	gdk_window_get_origin (gtk_widget_get_window (GTK_WIDGET (toplevel)), &cur_x, &cur_y);
+	#ifdef HAVE_WAYLAND
+	if (GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel)))) {
+		/* gdk_window_get_origin() always reports (0,0) for layer-shell
+		 * windows, since the compositor controls their position. Use
+		 * the geometry we track ourselves instead, otherwise the
+		 * initial hide/unhide animation would be skipped. */
+		cur_x = toplevel->priv->geometry.x;
+		cur_y = toplevel->priv->geometry.y;
+	} else
+#endif /* HAVE_WAYLAND */
+	{
+		gdk_window_get_origin (gtk_widget_get_window (GTK_WIDGET (toplevel)), &cur_x, &cur_y);
+	}
 
 	cur_x -= panel_multimonitor_x (toplevel->priv->monitor);
 	cur_y -= panel_multimonitor_y (toplevel->priv->monitor);
@@ -3807,7 +3906,7 @@ panel_toplevel_unhide (PanelToplevel *toplevel)
 {
 	g_return_if_fail (PANEL_IS_TOPLEVEL (toplevel));
 
-	if (toplevel->priv->state == PANEL_STATE_NORMAL)
+if (toplevel->priv->state == PANEL_STATE_NORMAL)
 		return;
 
 	toplevel->priv->state = PANEL_STATE_NORMAL;
@@ -3953,8 +4052,11 @@ panel_toplevel_enter_notify_event (GtkWidget        *widget,
 
 	toplevel = PANEL_TOPLEVEL (widget);
 
-	if (toplevel->priv->auto_hide && event->detail != GDK_NOTIFY_INFERIOR)
+	if (toplevel->priv->auto_hide &&
+	    event->detail != GDK_NOTIFY_INFERIOR) {
+		toplevel->priv->pointer_inside = TRUE;
 		panel_toplevel_queue_auto_unhide (toplevel);
+	}
 
 	if (GTK_WIDGET_CLASS (panel_toplevel_parent_class)->enter_notify_event)
 		return GTK_WIDGET_CLASS (panel_toplevel_parent_class)->enter_notify_event (widget, event);
@@ -3972,8 +4074,11 @@ panel_toplevel_leave_notify_event (GtkWidget        *widget,
 
 	toplevel = PANEL_TOPLEVEL (widget);
 
-	if (toplevel->priv->auto_hide && event->detail != GDK_NOTIFY_INFERIOR)
+	if (toplevel->priv->auto_hide &&
+	    event->detail != GDK_NOTIFY_INFERIOR) {
+		toplevel->priv->pointer_inside = FALSE;
 		panel_toplevel_queue_auto_hide (toplevel);
+	}
 
 	if (GTK_WIDGET_CLASS (panel_toplevel_parent_class)->leave_notify_event)
 		return GTK_WIDGET_CLASS (panel_toplevel_parent_class)->leave_notify_event (widget, event);
@@ -4783,6 +4888,7 @@ panel_toplevel_init (PanelToplevel *toplevel)
 
 	toplevel->priv = panel_toplevel_get_instance_private (toplevel);
 
+	toplevel->priv->pointer_inside   = FALSE;
 	toplevel->priv->expand          = TRUE;
 	toplevel->priv->orientation     = PANEL_ORIENTATION_BOTTOM;
 	toplevel->priv->size            = DEFAULT_SIZE;
