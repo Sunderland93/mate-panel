@@ -236,3 +236,102 @@ wayland_panel_toplevel_update_exclusive_zone (PanelToplevel* toplevel,
 {
 	gtk_layer_set_exclusive_zone (GTK_WINDOW (toplevel), exclusive_zone);
 }
+
+/* The autohide drop-zone is only an input surface: clear the surface so the
+ * underlying panel strip stays visible. */
+static gboolean
+wayland_panel_toplevel_autohide_window_draw (GtkWidget *widget,
+					     cairo_t   *cr)
+{
+	cairo_set_operator (cr, CAIRO_OPERATOR_CLEAR);
+	cairo_paint (cr);
+	return FALSE;
+}
+
+GtkWindow *
+wayland_panel_toplevel_create_autohide_window (PanelToplevel *toplevel)
+{
+	GtkWindow *window;
+	GdkScreen *screen;
+
+	window = GTK_WINDOW (gtk_window_new (GTK_WINDOW_TOPLEVEL));
+
+	gtk_widget_set_name (GTK_WIDGET (window), "MatePanelWindowHidden");
+	gtk_window_set_title (window, "MatePanelWindowHidden");
+	gtk_window_set_decorated (window, FALSE);
+	gtk_window_set_type_hint (window, GDK_WINDOW_TYPE_HINT_UTILITY);
+	gtk_window_set_skip_taskbar_hint (window, TRUE);
+	gtk_window_set_skip_pager_hint (window, TRUE);
+	gtk_window_set_accept_focus (window, FALSE);
+	gtk_window_set_focus_on_map (window, FALSE);
+	gtk_widget_set_app_paintable (GTK_WIDGET (window), TRUE);
+
+	/* grab crossing events on this surface; they drive the autohide
+	 * state machine independently of the (animated) panel surface */
+	gtk_widget_add_events (GTK_WIDGET (window),
+			       GDK_ENTER_NOTIFY_MASK |
+			       GDK_LEAVE_NOTIFY_MASK |
+			       GDK_POINTER_MOTION_MASK);
+
+	/* visually transparent: this window is only an input area */
+	screen = gtk_widget_get_screen (GTK_WIDGET (window));
+	if (gdk_screen_get_rgba_visual (screen))
+		gtk_widget_set_visual (GTK_WIDGET (window),
+				       gdk_screen_get_rgba_visual (screen));
+
+	gtk_layer_init_for_window (window);
+	gtk_layer_set_layer (window, GTK_LAYER_SHELL_LAYER_TOP);
+	gtk_layer_set_namespace (window, "panel");
+	gtk_layer_set_exclusive_zone (window, -1);
+	gtk_layer_set_keyboard_interactivity (window, FALSE);
+
+	/* place it with the {left, top} corner margins, like the panel */
+	gtk_layer_set_anchor (window, GTK_LAYER_SHELL_EDGE_LEFT, TRUE);
+	gtk_layer_set_anchor (window, GTK_LAYER_SHELL_EDGE_RIGHT, FALSE);
+	gtk_layer_set_anchor (window, GTK_LAYER_SHELL_EDGE_TOP, TRUE);
+	gtk_layer_set_anchor (window, GTK_LAYER_SHELL_EDGE_BOTTOM, FALSE);
+
+	g_signal_connect (window, "draw",
+			  G_CALLBACK (wayland_panel_toplevel_autohide_window_draw),
+			  NULL);
+
+	return window;
+}
+
+void
+wayland_panel_toplevel_autohide_window_show (GtkWindow          *window,
+					     PanelToplevel      *toplevel,
+					     const GdkRectangle *geometry,
+					     const GdkRectangle *monitor_geom)
+{
+	GdkDisplay *display;
+	int         monitor;
+	int         n_monitors;
+
+	display = gdk_display_get_default ();
+	n_monitors = gdk_display_get_n_monitors (display);
+	monitor = panel_toplevel_get_monitor (toplevel);
+	if (monitor < 0 || monitor >= n_monitors)
+		monitor = 0;
+
+	gtk_layer_set_monitor (window, gdk_display_get_monitor (display, monitor));
+
+	gtk_widget_set_size_request (GTK_WIDGET (window),
+				     geometry->width, geometry->height);
+	gtk_window_resize (window, geometry->width, geometry->height);
+
+	gtk_layer_set_margin (window, GTK_LAYER_SHELL_EDGE_LEFT,
+			      geometry->x - monitor_geom->x);
+	gtk_layer_set_margin (window, GTK_LAYER_SHELL_EDGE_TOP,
+			      geometry->y - monitor_geom->y);
+
+	if (!gtk_widget_get_visible (GTK_WIDGET (window)))
+		gtk_widget_show (GTK_WIDGET (window));
+}
+
+void
+wayland_panel_toplevel_autohide_window_hide (GtkWindow *window)
+{
+	if (gtk_widget_get_visible (GTK_WIDGET (window)))
+		gtk_widget_hide (GTK_WIDGET (window));
+}

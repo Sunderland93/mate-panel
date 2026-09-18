@@ -44,5 +44,11 @@ void wayland_panel_toplevel_move_resize (PanelToplevel*           toplevel,
                                          const GdkRectangle      *monitor_geom);
 void wayland_panel_toplevel_update_exclusive_zone (PanelToplevel* toplevel,
                                                    gint           exclusive_zone);
+GtkWindow *wayland_panel_toplevel_create_autohide_window (PanelToplevel *toplevel);
+void wayland_panel_toplevel_autohide_window_show (GtkWindow              *window,
+                                                  PanelToplevel          *toplevel,
+                                                  const GdkRectangle     *geometry,
+                                                  const GdkRectangle     *monitor_geom);
+void wayland_panel_toplevel_autohide_window_hide (GtkWindow *window);
 
 #endif /* __WAYLAND_BACKEND_H__ */
