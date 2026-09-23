@@ -215,10 +215,6 @@ struct _PanelToplevelPrivate {
 	   reported by enter/leave notifications (authoritative on
 	   Wayland where the window frame may not match the surface) */
 	guint                   pointer_inside : 1;
-	/* reserved work area (wlroots: exclusive_zone + margin) last
-	   committed while settled; kept constant while the panel slides
-	   so maximized windows don't move during the animation */
-	int                     wl_reserved;
 
 	/* Wayland autohide drop-zone surface: a transparent layer-shell
 	 * window overlaid on the hidden strip that receives enter/leave
@@ -1620,38 +1616,13 @@ static gboolean panel_toplevel_update_struts(PanelToplevel* toplevel, gboolean e
 #ifdef HAVE_WAYLAND
 	if (GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel)))) {
 		int  exclusive;
-		int  margin = 0;
 
 		wayland_panel_toplevel_update_placement (toplevel);
 
-		if (toplevel->priv->auto_hide) {
+		if (strut == 0) {
 			exclusive = 0;
 		} else {
-			switch (orientation) {
-			case PANEL_ORIENTATION_TOP:
-				margin = y - monitor_geom.y;
-				break;
-			case PANEL_ORIENTATION_BOTTOM:
-				margin = monitor_geom.y + monitor_geom.height - (y + height);
-				break;
-			case PANEL_ORIENTATION_LEFT:
-				margin = x - monitor_geom.x;
-				break;
-			case PANEL_ORIENTATION_RIGHT:
-				margin = monitor_geom.x + monitor_geom.width - (x + width);
-				break;
-			default:
-				break;
-			}
-
-			if (strut == 0) {
-				exclusive = 0;
-			} else if (toplevel->priv->animating) {
-				exclusive = MAX (0, toplevel->priv->wl_reserved - margin);
-			} else {
-				exclusive = (orientation & PANEL_HORIZONTAL_MASK) ? height : width;
-				toplevel->priv->wl_reserved = exclusive + margin;
-			}
+			exclusive = strut;
 		}
 
 		wayland_panel_toplevel_update_exclusive_zone (toplevel, exclusive);
