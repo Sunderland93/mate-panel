@@ -1619,11 +1619,18 @@ static gboolean panel_toplevel_update_struts(PanelToplevel* toplevel, gboolean e
 
 		wayland_panel_toplevel_update_placement (toplevel);
 
-		if (strut == 0) {
+		/* While the panel is visible it reserves its edge (strut) so that
+		 * maximized windows never overlap it. A hidden panel must not
+		 * reserve anything: on X11 the gap this would leave is invisible
+		 * because the wallpaper/root background is drawn everywhere, but on
+		 * Wayland desktop wallpaper services size their surfaces to the
+		 * reserved work area, so a reserved strip while hidden shows the
+		 * compositor's native background instead of the wallpaper. */
+		if (strut == 0 ||
+		    toplevel->priv->state != PANEL_STATE_NORMAL)
 			exclusive = 0;
-		} else {
+		else
 			exclusive = strut;
-		}
 
 		wayland_panel_toplevel_update_exclusive_zone (toplevel, exclusive);
 	}
