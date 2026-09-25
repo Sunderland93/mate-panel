@@ -77,6 +77,7 @@
 #define HANDLE_SIZE               10
 #define N_ATTACH_TOPLEVEL_SIGNALS 5
 #define N_ATTACH_WIDGET_SIGNALS   5
+#define AUTO_HIDE_HIT_MARGIN      4
 
 typedef enum {
 	PANEL_GRAB_OP_NONE,
@@ -210,6 +211,16 @@ struct _PanelToplevelPrivate {
 	guint                   updated_geometry_initial : 1;
 	/* flag to see if we have done the initial animation */
 	guint                   initial_animation_done : 1;
+	/* whether the pointer is currently over this toplevel, as
+	   reported by enter/leave notifications (authoritative on
+	   Wayland where the window frame may not match the surface) */
+	guint                   pointer_inside : 1;
+
+	/* Wayland autohide drop-zone surface: a transparent layer-shell
+	 * window overlaid on the hidden strip that receives enter/leave
+	 * events reliably, independently of the animated panel surface */
+	GtkWidget            *autohide_window;
+	GdkRectangle          autohide_window_geometry;
 };
 
 enum {
@@ -261,6 +272,8 @@ static void panel_toplevel_set_monitor_internal(PanelToplevel* toplevel, int mon
 
 static void panel_toplevel_drag_threshold_changed (PanelToplevel *toplevel);
 static void panel_toplevel_on_monitors_changed (GdkScreen *screen, gpointer user_data);
+
+static void panel_toplevel_update_autohide_window (PanelToplevel *toplevel);
 
 static void
 update_style_classes (PanelToplevel *toplevel)
@@ -1119,8 +1132,20 @@ void panel_toplevel_push_autohide_disabler(PanelToplevel* toplevel)
 {
 	g_return_if_fail (toplevel != NULL);
 
-	if (!toplevel->priv->n_autohide_disablers++)
-		panel_toplevel_queue_auto_hide (toplevel);
+	/* While a disabler is held (menu/dialog open) we don't just refuse
+	 * to start a new hide: we also cancel any pending hide and force the
+	 * panel visible, so transient pointer crossings or menu interactions
+	 * can never leave the panel hidden. */
+	if (toplevel->priv->n_autohide_disablers++ == 0) {
+		if (toplevel->priv->hide_timeout) {
+			g_source_remove (toplevel->priv->hide_timeout);
+			toplevel->priv->hide_timeout = 0;
+		}
+
+		if (toplevel->priv->auto_hide &&
+		    toplevel->priv->state == PANEL_STATE_AUTO_HIDDEN)
+			panel_toplevel_queue_auto_unhide (toplevel);
+	}
 }
 
 void panel_toplevel_pop_autohide_disabler(PanelToplevel* toplevel)
@@ -1128,7 +1153,7 @@ void panel_toplevel_pop_autohide_disabler(PanelToplevel* toplevel)
 	g_return_if_fail (toplevel != NULL);
 	g_return_if_fail (toplevel->priv->n_autohide_disablers > 0);
 
-	if (!--toplevel->priv->n_autohide_disablers)
+	if (--toplevel->priv->n_autohide_disablers == 0)
 		panel_toplevel_queue_auto_hide (toplevel);
 }
 
@@ -1422,6 +1447,29 @@ static gboolean panel_toplevel_contains_pointer(PanelToplevel* toplevel)
 	if (x == -1 || y == -1)
 		return FALSE;
 
+#ifdef HAVE_WAYLAND
+	if (GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (widget))) {
+		GdkWindow *pointer_window = gdk_device_get_window_at_position (pointer,
+								   NULL, NULL);
+		gboolean   result;
+
+		if (pointer_window != NULL) {
+			GdkWindow *panel_window = gtk_widget_get_window (widget);
+			GdkWindow *strip_window = toplevel->priv->autohide_window ?
+						  gtk_widget_get_window (GTK_WIDGET (toplevel->priv->autohide_window)) :
+						  NULL;
+
+			pointer_window = gdk_window_get_effective_toplevel (pointer_window);
+			result = (pointer_window == panel_window) ||
+				 (strip_window != NULL && pointer_window == strip_window);
+
+			return result;
+		}
+
+		return toplevel->priv->pointer_inside;
+	}
+#endif /* HAVE_WAYLAND */
+
 	if (x < toplevel->priv->geometry.x || x >= (toplevel->priv->geometry.x + toplevel->priv->geometry.width) ||
 	    y < toplevel->priv->geometry.y || y >= (toplevel->priv->geometry.y + toplevel->priv->geometry.height))
 		return FALSE;
@@ -1567,7 +1615,24 @@ static gboolean panel_toplevel_update_struts(PanelToplevel* toplevel, gboolean e
 
 #ifdef HAVE_WAYLAND
 	if (GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel)))) {
+		int  exclusive;
+
 		wayland_panel_toplevel_update_placement (toplevel);
+
+		/* While the panel is visible it reserves its edge (strut) so that
+		 * maximized windows never overlap it. A hidden panel must not
+		 * reserve anything: on X11 the gap this would leave is invisible
+		 * because the wallpaper/root background is drawn everywhere, but on
+		 * Wayland desktop wallpaper services size their surfaces to the
+		 * reserved work area, so a reserved strip while hidden shows the
+		 * compositor's native background instead of the wallpaper. */
+		if (strut == 0 ||
+		    toplevel->priv->state != PANEL_STATE_NORMAL)
+			exclusive = 0;
+		else
+			exclusive = strut;
+
+		wayland_panel_toplevel_update_exclusive_zone (toplevel, exclusive);
 	}
 #endif /* HAVE_WAYLAND */
 	return geometry_changed;
@@ -2272,6 +2337,8 @@ panel_toplevel_update_position (PanelToplevel *toplevel)
 
 	toplevel->priv->geometry.x = x;
 	toplevel->priv->geometry.y = y;
+
+	panel_toplevel_update_autohide_window (toplevel);
 }
 
 static int
@@ -2919,20 +2986,36 @@ panel_toplevel_move_resize_window (PanelToplevel *toplevel,
 
 	g_assert (gtk_widget_get_realized (widget));
 
-	if (move && resize)
-		gdk_window_move_resize (gtk_widget_get_window (widget),
-					toplevel->priv->geometry.x,
-					toplevel->priv->geometry.y,
-					toplevel->priv->geometry.width,
-					toplevel->priv->geometry.height);
-	else if (move)
-		gdk_window_move (gtk_widget_get_window (widget),
-				 toplevel->priv->geometry.x,
-				 toplevel->priv->geometry.y);
-	else if (resize)
-		gdk_window_resize (gtk_widget_get_window (widget),
-				   toplevel->priv->geometry.width,
-				   toplevel->priv->geometry.height);
+#ifdef HAVE_WAYLAND
+	if (GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (widget))) {
+		/* Layer-shell windows are positioned by the compositor using
+		 * anchors and margins, so we translate the geometry to margins
+		 * relative to the monitor the panel is attached to. */
+		if (toplevel->priv->updated_geometry_initial) {
+			GdkRectangle monitor_geom;
+			panel_toplevel_get_monitor_geometry (toplevel, &monitor_geom);
+			wayland_panel_toplevel_move_resize (toplevel,
+							    &toplevel->priv->geometry,
+							    &monitor_geom);
+		}
+	} else
+#endif /* HAVE_WAYLAND */
+	{
+		if (move && resize)
+			gdk_window_move_resize (gtk_widget_get_window (widget),
+						toplevel->priv->geometry.x,
+						toplevel->priv->geometry.y,
+						toplevel->priv->geometry.width,
+						toplevel->priv->geometry.height);
+		else if (move)
+			gdk_window_move (gtk_widget_get_window (widget),
+					 toplevel->priv->geometry.x,
+					 toplevel->priv->geometry.y);
+		else if (resize)
+			gdk_window_resize (gtk_widget_get_window (widget),
+					   toplevel->priv->geometry.width,
+					   toplevel->priv->geometry.height);
+	}
 
 	if (resize || move) {
 		for (list = toplevel->priv->panel_widget->applet_list; list != NULL; list = g_list_next (list)) {
@@ -2963,6 +3046,17 @@ static void
 panel_toplevel_initially_hide (PanelToplevel *toplevel)
 {
 	if (!toplevel->priv->attached) {
+#ifdef HAVE_WAYLAND
+		if (GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel)))) {
+			toplevel->priv->initial_animation_done = TRUE;
+			if (!toplevel->priv->auto_hide)
+				toplevel->priv->state = PANEL_STATE_NORMAL;
+			else
+				toplevel->priv->state = PANEL_STATE_AUTO_HIDDEN;
+			gtk_widget_queue_resize (GTK_WIDGET (toplevel));
+			return;
+		}
+#endif /* HAVE_WAYLAND */
 		toplevel->priv->initial_animation_done = FALSE;
 
 		/* We start the panel off hidden until all the applets are
@@ -3050,6 +3144,8 @@ panel_toplevel_realize (GtkWidget *widget)
 	panel_toplevel_initially_hide (toplevel);
 
 	panel_toplevel_move_resize_window (toplevel, TRUE, TRUE);
+
+	panel_toplevel_update_autohide_window (toplevel);
 }
 
 static void
@@ -3090,6 +3186,11 @@ static void
 panel_toplevel_dispose (GObject *widget)
 {
 	PanelToplevel *toplevel = (PanelToplevel *) widget;
+
+	if (toplevel->priv->autohide_window) {
+		gtk_widget_destroy (toplevel->priv->autohide_window);
+		toplevel->priv->autohide_window = NULL;
+	}
 
 	g_clear_pointer (&toplevel->priv->settings_path, g_free);
 
@@ -3546,7 +3647,18 @@ panel_toplevel_motion_notify_event (GtkWidget      *widget,
 static gboolean
 panel_toplevel_animation_timeout (PanelToplevel *toplevel)
 {
-	gtk_widget_queue_resize (GTK_WIDGET (toplevel));
+#ifdef HAVE_WAYLAND
+	if (GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel)))) {
+		if (toplevel->priv->animating) {
+			panel_toplevel_update_position (toplevel);
+			panel_toplevel_update_struts (toplevel, FALSE);
+			panel_toplevel_move_resize_window (toplevel, TRUE, TRUE);
+		}
+	} else
+#endif /* HAVE_WAYLAND */
+	{
+		gtk_widget_queue_resize (GTK_WIDGET (toplevel));
+	}
 
 	if (!toplevel->priv->animating) {
 		toplevel->priv->animation_end_x              = 0xdead;
@@ -3666,7 +3778,19 @@ panel_toplevel_start_animation (PanelToplevel *toplevel)
 #endif /* HAVE_X11 */
 	panel_toplevel_update_struts (toplevel, FALSE);
 
-	gdk_window_get_origin (gtk_widget_get_window (GTK_WIDGET (toplevel)), &cur_x, &cur_y);
+	#ifdef HAVE_WAYLAND
+	if (GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel)))) {
+		/* gdk_window_get_origin() always reports (0,0) for layer-shell
+		 * windows, since the compositor controls their position. Use
+		 * the geometry we track ourselves instead, otherwise the
+		 * initial hide/unhide animation would be skipped. */
+		cur_x = toplevel->priv->geometry.x;
+		cur_y = toplevel->priv->geometry.y;
+	} else
+#endif /* HAVE_WAYLAND */
+	{
+		gdk_window_get_origin (gtk_widget_get_window (GTK_WIDGET (toplevel)), &cur_x, &cur_y);
+	}
 
 	cur_x -= panel_multimonitor_x (toplevel->priv->monitor);
 	cur_y -= panel_multimonitor_y (toplevel->priv->monitor);
@@ -3775,6 +3899,8 @@ panel_toplevel_hide (PanelToplevel    *toplevel,
         }
 
 	gtk_widget_queue_resize (GTK_WIDGET (toplevel));
+
+	panel_toplevel_update_autohide_window (toplevel);
 }
 
 static gboolean
@@ -3786,6 +3912,18 @@ panel_toplevel_auto_hide_timeout_handler (PanelToplevel *toplevel)
 		toplevel->priv->hide_timeout = 0;
 		return FALSE;
 	}
+
+#ifdef HAVE_WAYLAND
+	/* Re-check the pointer when the hide finally commits: a leave event
+	 * may have been lost or reported late, and the pointer may actually
+	 * be back over the panel (or its autohide strip). Never hide while
+	 * the pointer is engaged. */
+	if (GDK_IS_WAYLAND_DISPLAY (gtk_widget_get_display (GTK_WIDGET (toplevel))) &&
+	    panel_toplevel_contains_pointer (toplevel)) {
+		toplevel->priv->hide_timeout = 0;
+		return FALSE;
+	}
+#endif /* HAVE_WAYLAND */
 
 	/* keep coming back until the animation has finished.
 	 * FIXME: we should really remove the timeout/idle
@@ -3828,6 +3966,8 @@ panel_toplevel_unhide (PanelToplevel *toplevel)
 	}
 
 	gtk_widget_queue_resize (GTK_WIDGET (toplevel));
+
+	panel_toplevel_update_autohide_window (toplevel);
 
 	if (!toplevel->priv->animate)
 		g_signal_emit (toplevel, toplevel_signals [UNHIDE_SIGNAL], 0);
@@ -3879,8 +4019,9 @@ panel_toplevel_queue_auto_hide (PanelToplevel *toplevel)
 
 	if (!toplevel->priv->auto_hide ||
 	    panel_toplevel_contains_pointer (toplevel) ||
-	    panel_toplevel_get_autohide_disabled (toplevel))
-	  return;
+	    panel_toplevel_get_autohide_disabled (toplevel)) {
+		return;
+	}
 
 	if (toplevel->priv->unhide_timeout)
 		g_source_remove (toplevel->priv->unhide_timeout);
@@ -3953,8 +4094,11 @@ panel_toplevel_enter_notify_event (GtkWidget        *widget,
 
 	toplevel = PANEL_TOPLEVEL (widget);
 
-	if (toplevel->priv->auto_hide && event->detail != GDK_NOTIFY_INFERIOR)
+	if (toplevel->priv->auto_hide &&
+	    event->detail != GDK_NOTIFY_INFERIOR) {
+		toplevel->priv->pointer_inside = TRUE;
 		panel_toplevel_queue_auto_unhide (toplevel);
+	}
 
 	if (GTK_WIDGET_CLASS (panel_toplevel_parent_class)->enter_notify_event)
 		return GTK_WIDGET_CLASS (panel_toplevel_parent_class)->enter_notify_event (widget, event);
@@ -3972,8 +4116,11 @@ panel_toplevel_leave_notify_event (GtkWidget        *widget,
 
 	toplevel = PANEL_TOPLEVEL (widget);
 
-	if (toplevel->priv->auto_hide && event->detail != GDK_NOTIFY_INFERIOR)
+	if (toplevel->priv->auto_hide &&
+	    event->detail != GDK_NOTIFY_INFERIOR) {
+		toplevel->priv->pointer_inside = FALSE;
 		panel_toplevel_queue_auto_hide (toplevel);
+	}
 
 	if (GTK_WIDGET_CLASS (panel_toplevel_parent_class)->leave_notify_event)
 		return GTK_WIDGET_CLASS (panel_toplevel_parent_class)->leave_notify_event (widget, event);
@@ -4775,6 +4922,124 @@ background_changed (PanelBackground *background,
 	panel_widget_emit_background_changed (toplevel->priv->panel_widget);
 }
 
+#ifdef HAVE_WAYLAND
+static gboolean
+panel_toplevel_autohide_window_enter_notify (GtkWidget        *widget,
+					     GdkEventCrossing *event,
+					     PanelToplevel    *toplevel)
+{
+	if (event->detail != GDK_NOTIFY_INFERIOR) {
+		toplevel->priv->pointer_inside = TRUE;
+		panel_toplevel_queue_auto_unhide (toplevel);
+	}
+
+	return FALSE;
+}
+
+static gboolean
+panel_toplevel_autohide_window_leave_notify (GtkWidget        *widget,
+					     GdkEventCrossing *event,
+					     PanelToplevel    *toplevel)
+{
+	if (event->detail != GDK_NOTIFY_INFERIOR) {
+		toplevel->priv->pointer_inside = FALSE;
+		panel_toplevel_queue_auto_hide (toplevel);
+	}
+
+	return FALSE;
+}
+
+/* Keep the autohide drop-zone window glued to the strip that the panel
+ * leaves visible while hidden, so the strip is an always-available input
+ * surface regardless of where the animated panel surface currently is. */
+static void
+panel_toplevel_update_autohide_window (PanelToplevel *toplevel)
+{
+	GdkRectangle monitor_geom;
+	GdkRectangle new_g;
+	GdkRectangle *g;
+	int          auto_hide_size;
+	int          hit_size;
+
+	if (!toplevel->priv->autohide_window)
+		return;
+
+	if (!toplevel->priv->auto_hide ||
+	    toplevel->priv->state != PANEL_STATE_AUTO_HIDDEN ||
+	    toplevel->priv->geometry.width <= 0 ||
+	    toplevel->priv->geometry.height <= 0) {
+		/* reset the cache so a later show (possibly at the same
+		 * geometry) is always performed */
+		toplevel->priv->autohide_window_geometry.x = -1;
+		toplevel->priv->autohide_window_geometry.y = -1;
+		toplevel->priv->autohide_window_geometry.width = 0;
+		toplevel->priv->autohide_window_geometry.height = 0;
+
+		if (gtk_widget_get_visible (toplevel->priv->autohide_window)) {
+			wayland_panel_toplevel_autohide_window_hide (
+				GTK_WINDOW (toplevel->priv->autohide_window));
+		}
+		return;
+	}
+
+	/* The drop-zone is the input surface for the hidden strip. Make it
+	 * a few pixels thicker than the visible strip, growing into the
+	 * screen, so the pointer does not have to land on the exact edge
+	 * pixel to unhide the panel. */
+	panel_toplevel_get_monitor_geometry (toplevel, &monitor_geom);
+	auto_hide_size = panel_toplevel_get_effective_auto_hide_size (toplevel);
+	hit_size = auto_hide_size + AUTO_HIDE_HIT_MARGIN;
+
+	g = &new_g;
+
+	switch (toplevel->priv->orientation) {
+	case PANEL_ORIENTATION_TOP:
+		g->x      = toplevel->priv->geometry.x;
+		g->width  = toplevel->priv->geometry.width;
+		g->y      = monitor_geom.y;
+		g->height = hit_size;
+		break;
+	case PANEL_ORIENTATION_BOTTOM:
+		g->x      = toplevel->priv->geometry.x;
+		g->width  = toplevel->priv->geometry.width;
+		g->y      = monitor_geom.y + monitor_geom.height - hit_size;
+		g->height = hit_size;
+		break;
+	case PANEL_ORIENTATION_LEFT:
+		g->x      = monitor_geom.x;
+		g->width  = hit_size;
+		g->y      = toplevel->priv->geometry.y;
+		g->height = toplevel->priv->geometry.height;
+		break;
+	case PANEL_ORIENTATION_RIGHT:
+		g->x      = monitor_geom.x + monitor_geom.width - hit_size;
+		g->width  = hit_size;
+		g->y      = toplevel->priv->geometry.y;
+		g->height = toplevel->priv->geometry.height;
+		break;
+	default:
+		return;
+	}
+
+	/* re-place the surface only when something actually changed */
+	if (new_g.x != toplevel->priv->autohide_window_geometry.x ||
+	    new_g.y != toplevel->priv->autohide_window_geometry.y ||
+	    new_g.width != toplevel->priv->autohide_window_geometry.width ||
+	    new_g.height != toplevel->priv->autohide_window_geometry.height) {
+		toplevel->priv->autohide_window_geometry = new_g;
+
+		wayland_panel_toplevel_autohide_window_show (
+			GTK_WINDOW (toplevel->priv->autohide_window),
+			toplevel, g, &monitor_geom);
+	}
+}
+#else /* !HAVE_WAYLAND */
+static void
+panel_toplevel_update_autohide_window (PanelToplevel *toplevel)
+{
+}
+#endif /* HAVE_WAYLAND */
+
 static void
 panel_toplevel_init (PanelToplevel *toplevel)
 {
@@ -4783,6 +5048,7 @@ panel_toplevel_init (PanelToplevel *toplevel)
 
 	toplevel->priv = panel_toplevel_get_instance_private (toplevel);
 
+	toplevel->priv->pointer_inside   = FALSE;
 	toplevel->priv->expand          = TRUE;
 	toplevel->priv->orientation     = PANEL_ORIENTATION_BOTTOM;
 	toplevel->priv->size            = DEFAULT_SIZE;
@@ -4890,6 +5156,17 @@ panel_toplevel_init (PanelToplevel *toplevel)
 #ifdef HAVE_WAYLAND
 	if (GDK_IS_WAYLAND_DISPLAY (gdk_display_get_default ())) {
 		wayland_panel_toplevel_init (toplevel);
+
+		toplevel->priv->autohide_window =
+			GTK_WIDGET (wayland_panel_toplevel_create_autohide_window (toplevel));
+		g_signal_connect (toplevel->priv->autohide_window,
+				  "enter-notify-event",
+				  G_CALLBACK (panel_toplevel_autohide_window_enter_notify),
+				  toplevel);
+		g_signal_connect (toplevel->priv->autohide_window,
+				  "leave-notify-event",
+				  G_CALLBACK (panel_toplevel_autohide_window_leave_notify),
+				  toplevel);
 	}
 #endif /* HAVE_WAYLAND */
 }
@@ -5426,6 +5703,8 @@ panel_toplevel_set_auto_hide (PanelToplevel *toplevel,
 		panel_toplevel_queue_auto_hide (toplevel);
 	else
 		panel_toplevel_queue_auto_unhide (toplevel);
+
+	panel_toplevel_update_autohide_window (toplevel);
 
 	if (panel_toplevel_update_struts (toplevel, FALSE))
 		gtk_widget_queue_resize (GTK_WIDGET (toplevel));

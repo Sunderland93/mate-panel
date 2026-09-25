@@ -64,6 +64,8 @@ struct _PanelMenuBarPrivate {
 	GSettings* settings;
 
 	PanelOrientation orientation;
+
+	gboolean disabler_setup;
 };
 
 enum {
@@ -227,6 +229,20 @@ static void panel_menu_bar_set_property(GObject* object, guint prop_id, const GV
 	}
 }
 
+static void panel_menu_bar_menu_shown (GtkWidget *menu, PanelMenuBar *menubar)
+{
+	(void) menu;
+
+	panel_toplevel_push_autohide_disabler (menubar->priv->panel->toplevel);
+}
+
+static void panel_menu_bar_menu_deactivated (GtkWidget *menu, PanelMenuBar *menubar)
+{
+	(void) menu;
+
+	panel_toplevel_pop_autohide_disabler (menubar->priv->panel->toplevel);
+}
+
 static void panel_menu_bar_parent_set(GtkWidget* widget, GtkWidget* previous_parent)
 {
 	PanelMenuBar* menubar = PANEL_MENU_BAR(widget);
@@ -251,6 +267,37 @@ static void panel_menu_bar_parent_set(GtkWidget* widget, GtkWidget* previous_par
 	if (menubar->priv->desktop_item)
 	{
 		panel_desktop_menu_item_set_panel(menubar->priv->desktop_item, menubar->priv->panel);
+	}
+
+	if (!menubar->priv->disabler_setup)
+	{
+		GtkWidget *menu;
+
+		menubar->priv->disabler_setup = TRUE;
+
+		menu = menubar->priv->applications_menu;
+		if (menu) {
+			g_signal_connect(menu, "show",
+			                 G_CALLBACK (panel_menu_bar_menu_shown), menubar);
+			g_signal_connect(menu, "deactivate",
+			                 G_CALLBACK (panel_menu_bar_menu_deactivated), menubar);
+		}
+
+		menu = gtk_menu_item_get_submenu(GTK_MENU_ITEM(menubar->priv->places_item));
+		if (menu) {
+			g_signal_connect(menu, "show",
+			                 G_CALLBACK (panel_menu_bar_menu_shown), menubar);
+			g_signal_connect(menu, "deactivate",
+			                 G_CALLBACK (panel_menu_bar_menu_deactivated), menubar);
+		}
+
+		menu = gtk_menu_item_get_submenu(GTK_MENU_ITEM(menubar->priv->desktop_item));
+		if (menu) {
+			g_signal_connect(menu, "show",
+			                 G_CALLBACK (panel_menu_bar_menu_shown), menubar);
+			g_signal_connect(menu, "deactivate",
+			                 G_CALLBACK (panel_menu_bar_menu_deactivated), menubar);
+		}
 	}
 }
 
