@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - backend_refactor
   pull_request:
     branches:
       - master
@@ -15,7 +16,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  MATE_PANEL_DEP: 1.28.2
+  # Includes mate-systemd.h, required by mate-panel since ba8658f1.
+  MATE_DESKTOP_REF: v1.29.1
   CONFIGURE_FLAGS: --enable-compile-warnings=maximum
   CFLAGS: -g -O2 -Werror=pointer-arith -Werror=implicit-function-declaration
   JOBS: 2
@@ -131,6 +133,7 @@ jobs:
         run: |
           echo "PATH=${MATE_DESKTOP_INSTALL_PATH}/bin:${PATH}" >> "$GITHUB_ENV"
           echo "PKG_CONFIG_PATH=${MATE_DESKTOP_INSTALL_PATH}/lib/pkgconfig:${PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${MATE_DESKTOP_INSTALL_PATH}/lib:${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
 
       # Debugging
       - name: Show environment
@@ -169,27 +172,27 @@ jobs:
           key: ${{ github.job }}-${{ matrix.container }}-${{ matrix.cc }}
 
       # Cache the build of the mate-desktop dependency
-      - name: Cache mate-desktop v${{env.MATE_PANEL_DEP}} dependency
+      - name: Cache mate-desktop dependency
         uses: actions/cache@v3
         id: cache-mate-desktop
         with:
           path: ${{env.MATE_DESKTOP_INSTALL_PATH}}
           # We try and be as specific as possible not to use the wrongly cached
           # build, as this is a *binary*.
-          key: ${{runner.os}}-${{runner.arch}}-${{matrix.container}}-build-mate-desktop-${{env.MATE_PANEL_DEP}}
+          key: ${{runner.os}}-${{runner.arch}}-${{matrix.container}}-build-mate-desktop-${{env.MATE_DESKTOP_REF}}
 
       # Checkout mate-desktop dep, if not already cached
-      - name: Checkout mate-desktop v${{env.MATE_PANEL_DEP}}
+      - name: Checkout mate-desktop dependency
         uses: actions/checkout@v3
         if: ${{ steps.cache-mate-desktop.outputs.cache-hit != 'true' }}
         with:
           repository: mate-desktop/mate-desktop
-          ref: v${{env.MATE_PANEL_DEP}}
+          ref: ${{env.MATE_DESKTOP_REF}}
           path: mate-desktop
           submodules: true
 
       # Build and install mate-desktop dep, if not already cached
-      - name: Install mate-desktop v${{env.MATE_PANEL_DEP}}
+      - name: Install mate-desktop dependency
         if: ${{ steps.cache-mate-desktop.outputs.cache-hit != 'true' }}
         run: |
           cd mate-desktop
@@ -218,6 +221,161 @@ jobs:
         # build system itself, rather than the build.
         if: ${{ startsWith(matrix.container, 'debian:') }}
         run: make -C mate-panel -j ${{ env.JOBS }} distcheck
+
+  quality:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+
+    env:
+      MATE_DESKTOP_INSTALL_PATH: ${{ github.workspace }}/mate-desktop-install
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Strict build and test
+            kind: strict
+            setup: -Dcompile-warnings=error
+            cflags: >-
+              -Wno-error=deprecated-declarations
+              -Wno-error=bad-function-cast
+              -Wno-error=missing-field-initializers
+              -Wno-error=cast-function-type
+              -Wno-error=discarded-qualifiers
+              -Wno-error=sign-compare
+              -Wno-error=format-nonliteral
+          - name: Sanitizer build and test
+            kind: sanitizers
+            setup: -Dintrospection=disabled -Db_sanitize=address,undefined -Db_lundef=false
+            cflags: ''
+
+    steps:
+      - name: Setup environment
+        run: |
+          echo "PATH=${MATE_DESKTOP_INSTALL_PATH}/bin:${PATH}" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=${MATE_DESKTOP_INSTALL_PATH}/lib/pkgconfig:${PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${MATE_DESKTOP_INSTALL_PATH}/lib:${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: |
+          pacman --noconfirm -Syu
+          pacman --noconfirm -S ${ARCH_BUILD_DEPS} ${ARCH_BUILD_DEPS_MATE_DESKTOP}
+
+      - uses: actions/checkout@v4
+        with:
+          path: mate-panel
+          submodules: true
+
+      - name: Cache mate-desktop dependency
+        uses: actions/cache@v4
+        id: cache-mate-desktop
+        with:
+          path: ${{ env.MATE_DESKTOP_INSTALL_PATH }}
+          key: ${{ runner.os }}-${{ runner.arch }}-archlinux-quality-mate-desktop-${{ env.MATE_DESKTOP_REF }}
+
+      - name: Checkout mate-desktop dependency
+        uses: actions/checkout@v4
+        if: ${{ steps.cache-mate-desktop.outputs.cache-hit != 'true' }}
+        with:
+          repository: mate-desktop/mate-desktop
+          ref: ${{ env.MATE_DESKTOP_REF }}
+          path: mate-desktop
+          submodules: true
+
+      - name: Install mate-desktop dependency
+        if: ${{ steps.cache-mate-desktop.outputs.cache-hit != 'true' }}
+        run: |
+          cd mate-desktop
+          NOCONFIGURE=1 ./autogen.sh
+          ./configure --prefix="${MATE_DESKTOP_INSTALL_PATH}"
+          make -j ${{ env.JOBS }}
+          make -j ${{ env.JOBS }} install
+
+      - name: Configure
+        env:
+          # GTK 3 deprecations are known technical debt; keep every other
+          # warning fatal. Newer GCC also diagnoses old libegg/GLib idioms.
+          CFLAGS: ${{ matrix.cflags }}
+        run: meson setup build mate-panel ${{ matrix.setup }}
+
+      - name: Build
+        run: meson compile -C build -j ${{ env.JOBS }}
+
+      - name: Test
+        run: meson test -C build --print-errorlogs
+
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meson-logs-${{ matrix.kind }}
+          path: build/meson-logs/
+
+  scan-build:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+
+    env:
+      MATE_DESKTOP_INSTALL_PATH: ${{ github.workspace }}/mate-desktop-install
+
+    steps:
+      - name: Setup environment
+        run: |
+          echo "PATH=${MATE_DESKTOP_INSTALL_PATH}/bin:${PATH}" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=${MATE_DESKTOP_INSTALL_PATH}/lib/pkgconfig:${PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${MATE_DESKTOP_INSTALL_PATH}/lib:${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: |
+          pacman --noconfirm -Syu
+          pacman --noconfirm -S ${ARCH_BUILD_DEPS} ${ARCH_BUILD_DEPS_MATE_DESKTOP}
+
+      - uses: actions/checkout@v4
+        with:
+          path: mate-panel
+          submodules: true
+
+      - name: Cache mate-desktop dependency
+        uses: actions/cache@v4
+        id: cache-mate-desktop
+        with:
+          path: ${{ env.MATE_DESKTOP_INSTALL_PATH }}
+          key: ${{ runner.os }}-${{ runner.arch }}-archlinux-scan-build-mate-desktop-${{ env.MATE_DESKTOP_REF }}
+
+      - name: Checkout mate-desktop dependency
+        uses: actions/checkout@v4
+        if: ${{ steps.cache-mate-desktop.outputs.cache-hit != 'true' }}
+        with:
+          repository: mate-desktop/mate-desktop
+          ref: ${{ env.MATE_DESKTOP_REF }}
+          path: mate-desktop
+          submodules: true
+
+      - name: Install mate-desktop dependency
+        if: ${{ steps.cache-mate-desktop.outputs.cache-hit != 'true' }}
+        run: |
+          cd mate-desktop
+          NOCONFIGURE=1 ./autogen.sh
+          ./configure --prefix="${MATE_DESKTOP_INSTALL_PATH}"
+          make -j ${{ env.JOBS }}
+          make -j ${{ env.JOBS }} install
+
+      - name: Configure
+        env:
+          CC: clang
+        run: meson setup build-scan mate-panel
+
+      - name: Run scan-build
+        run: scan-build --status-bugs -o scan-results ninja -C build-scan -j ${{ env.JOBS }}
+
+      - name: Upload report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-build
+          path: scan-results/
 
   # Do we need the real build for cppcheck run?  I don't think so
   cppcheck:
